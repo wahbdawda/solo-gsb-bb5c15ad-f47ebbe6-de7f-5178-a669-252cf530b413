@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 
@@ -117,6 +118,43 @@ def get_message(message_id: str) -> dict:
 )
 def get_thread(message_id: str) -> dict:
     result = service.get_thread(message_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="message not found")
+    if result.get("invalid"):
+        raise HTTPException(
+            status_code=409,
+            detail="message belongs to a reference cycle and is not attached to any thread",
+        )
+    return result
+
+
+@app.get(
+    "/threads/{message_id}/page",
+    tags=["threads"],
+    summary="游标分页查询会话树（先序扁平展开，含 depth）",
+)
+def get_thread_page(
+    message_id: str,
+    limit: int = Query(50, ge=1, le=200, description="每页条数（1～200）"),
+    cursor: Optional[str] = Query(None, description="上一页返回的 next_cursor；首次请求留空"),
+) -> dict:
+    try:
+        result = service.get_thread_page(message_id, limit, cursor)
+    except service.CursorMalformed:
+        raise HTTPException(status_code=422, detail="cursor is malformed")
+    except service.CursorThreadMismatch:
+        raise HTTPException(
+            status_code=422,
+            detail="cursor does not belong to the thread of the path message_id",
+        )
+    except service.CursorStale:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "cursor_stale",
+                "message": "the thread has changed since the cursor was issued; restart from the first page",
+            },
+        )
     if result is None:
         raise HTTPException(status_code=404, detail="message not found")
     if result.get("invalid"):

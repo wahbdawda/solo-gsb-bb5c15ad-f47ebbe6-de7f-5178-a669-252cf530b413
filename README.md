@@ -49,10 +49,67 @@ ports:
 | `POST` | `/relinks` | 迟到邮件归档后，批量修复此前断链的有效邮件（HTTP 200） |
 | `GET` | `/messages/{message_id}` | 查询单封邮件及其最终父节点 |
 | `GET` | `/threads/{message_id}` | 查询该邮件所属完整会话树；环邮件返回 **409** |
+| `GET` | `/threads/{message_id}/page?limit=&cursor=` | 会话树**游标分页**（先序扁平展开，含 `depth`），适配大型会话 |
 | `GET` | `/health` | 健康检查 |
 
 未知 ID：批次 / 邮件查询、`/relinks` 返回 **404**；请求体不合法返回 **422**；
 `/relinks` 若合并候选关系后形成环，整次返回 **409** 且不写库。
+
+### 大型会话分页：`GET /threads/{message_id}/page`
+
+完整树 `GET /threads/{message_id}` 行为保持不变；需要遍历大型会话时使用分页接口：
+
+- 首次请求**不带** `cursor`，沿用与完整树完全一致的子节点排序
+  （`(sent_at, message_id)` 升序）做**先序展开**；
+- 返回扁平 `items`（节点字段与树节点相同，去掉 `children`、增加整数
+  `depth`，根为 0）、`root_id`、`limit` 与不透明 `next_cursor`；
+- `limit` 限定 **1～200**（默认 50）；取到末页时 `next_cursor` 为 `null`；
+- 游标封装**根 ID、下一偏移与 revision**：revision 根据整棵树每个节点的
+  `message_id` / `parent_id` / `sent_at` 计算。后续请求**必须重新计算
+  revision**——若会话树在此期间被补链（`POST /relinks`）或新邮件并入而
+  发生变化，返回 **409** `{"detail": {"error": "cursor_stale", …}}`，
+  调用方应丢弃游标、从第一页重新开始，从而避免跨页漏项或重复；
+- 游标格式错误（无法解析、字段缺失/非法、版本不符）返回 **422**；
+  游标来自**另一棵会话树**（与路径 `message_id` 当前所属会话不符）同样
+  返回 **422**；路径邮件未知返回 **404**；环内邮件返回 **409**。
+- 游标为不透明字符串，客户端不应自行解析或构造。
+
+```bash
+# 服务监听 8000 端口；首页（无需 cursor）
+curl 'http://localhost:8000/threads/A/page?limit=2'
+```
+
+```jsonc
+{
+  "root_id": "A",
+  "limit": 2,
+  "items": [
+    {"message_id": "A", "parent_id": null, "depth": 0,
+     "in_reply_to": null, "references": [],
+     "sent_at": "2026-09-18T08:00:00+00:00", "subject": "例会通知"},
+    {"message_id": "B", "parent_id": "A", "depth": 1,
+     "in_reply_to": "A", "references": ["A"],
+     "sent_at": "2026-09-18T09:00:00+00:00", "subject": "Re: 例会通知"}
+  ],
+  "next_cursor": "djEcxY…"          // 原样回传取下一页；末页为 null
+}
+```
+
+```bash
+# 翻页：把上一页的 next_cursor 原样带上
+curl 'http://localhost:8000/threads/A/page?limit=2&cursor=djEcxY%E2%80%A6'
+```
+
+补链后继续使用旧游标（HTTP **409**，树已变化）：
+
+```json
+{
+  "detail": {
+    "error": "cursor_stale",
+    "message": "the thread has changed since the cursor was issued; restart from the first page"
+  }
+}
+```
 
 ### 提交示例
 
@@ -219,7 +276,8 @@ SQLite（WAL 模式），表在服务启动时自动创建：
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8000
-# 地址：http://localhost:8000  （DATABASE_PATH 默认 data/mailarchive.db）
+# 服务监听 8000 端口：http://localhost:8000  （/docs 为 Swagger UI；
+# DATABASE_PATH 默认 data/mailarchive.db）
 ```
 
 运行测试：

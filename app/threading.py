@@ -235,14 +235,14 @@ def _sort_key(sent_at: str, message_id: str) -> tuple[str, str]:
     return (sent_at, message_id)
 
 
-def build_forest(
+def _sorted_tree(
     messages: dict[str, ThreadMessage],
     parent_of: dict[str, Optional[str]],
-) -> list[dict]:
-    """把 parent_of 展开为稳定排序的会话树。
+) -> tuple[list[str], dict[str, list[str]]]:
+    """构造根列表与子节点表，并按 (sent_at, message_id) 稳定排序。
 
-    每棵树按 (sent_at, message_id) 排序；同一父节点下的子节点、
-    以及根之间都使用同样的键，保证全序稳定。
+    嵌套树（build_forest）与扁平先序展开（build_flat_tree）共用同一套
+    排序结果，保证两种展开的节点顺序完全一致。
     """
 
     children: dict[str, list[str]] = {}
@@ -259,6 +259,20 @@ def build_forest(
     roots.sort(key=node_key)
     for kids in children.values():
         kids.sort(key=node_key)
+    return roots, children
+
+
+def build_forest(
+    messages: dict[str, ThreadMessage],
+    parent_of: dict[str, Optional[str]],
+) -> list[dict]:
+    """把 parent_of 展开为稳定排序的会话树。
+
+    每棵树按 (sent_at, message_id) 排序；同一父节点下的子节点、
+    以及根之间都使用同样的键，保证全序稳定。
+    """
+
+    roots, children = _sorted_tree(messages, parent_of)
 
     def to_node(mid: str) -> dict:
         msg = messages[mid]
@@ -273,3 +287,37 @@ def build_forest(
         }
 
     return [to_node(r) for r in roots]
+
+
+def build_flat_tree(
+    messages: dict[str, ThreadMessage],
+    parent_of: dict[str, Optional[str]],
+) -> list[dict]:
+    """与 build_forest 相同的排序，把会话树先序展开为扁平节点列表。
+
+    每个节点在树节点字段的基础上增加 depth（根为 0），不含 children；
+    供 GET /threads/{message_id}/page 做偏移分页。
+    """
+
+    roots, children = _sorted_tree(messages, parent_of)
+
+    def to_item(mid: str, depth: int) -> list[dict]:
+        msg = messages[mid]
+        head = {
+            "message_id": msg.message_id,
+            "parent_id": parent_of.get(mid),
+            "in_reply_to": msg.in_reply_to,
+            "references": list(msg.references),
+            "sent_at": msg.sent_at,
+            "subject": msg.subject,
+            "depth": depth,
+        }
+        out = [head]
+        for kid in children.get(mid, []):
+            out.extend(to_item(kid, depth + 1))
+        return out
+
+    items: list[dict] = []
+    for root in roots:
+        items.extend(to_item(root, 0))
+    return items

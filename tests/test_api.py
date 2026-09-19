@@ -370,3 +370,223 @@ def test_relink_self_candidate_is_a_cycle(client):
     r = client.post("/relinks", json={"message_ids": ["zz"]})
     assert r.status_code == 409
     assert r.json()["detail"]["cycles"] == [["zz"]]
+
+
+# ---------------------------------------------------------------------------
+# GET /threads/{message_id}/page：稳定游标分页
+# ---------------------------------------------------------------------------
+
+
+def _seed_paged_thread(client):
+    """归档 R -> B -> C、R -> D 的会话；先序应为 R(0) B(1) C(2) D(1)。"""
+
+    client.post("/batches", json={"messages": [
+        _m("R", sent="2026-09-18T08:00:00+00:00"),
+        _m("B", irt="R", refs=["R"], sent="2026-09-18T09:00:00+00:00"),
+        _m("C", irt="B", refs=["R", "B"], sent="2026-09-18T10:00:00+00:00"),
+        _m("D", irt="R", refs=["R"], sent="2026-09-18T11:00:00+00:00"),
+    ]})
+
+
+def test_thread_page_first_page_is_flat_preorder_with_depth(client):
+    _seed_paged_thread(client)
+    r = client.get("/threads/R/page", params={"limit": 2})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["root_id"] == "R"
+    assert body["limit"] == 2
+    assert [(i["message_id"], i["depth"]) for i in body["items"]] == [
+        ("R", 0),
+        ("B", 1),
+    ]
+    assert body["next_cursor"]
+
+    item = body["items"][1]
+    assert set(item) == {
+        "message_id", "parent_id", "in_reply_to", "references",
+        "sent_at", "subject", "depth",
+    }
+    assert item["parent_id"] == "R"
+    assert item["references"] == ["R"]
+
+
+def test_thread_page_walks_all_pages_without_gaps_or_dupes(client):
+    _seed_paged_thread(client)
+    seen: list[tuple[str, int]] = []
+    cursor = None
+    pages = 0
+    while True:
+        params = {"limit": 2}
+        if cursor:
+            params["cursor"] = cursor
+        body = client.get("/threads/D/page", params=params).json()
+        pages += 1
+        seen.extend((i["message_id"], i["depth"]) for i in body["items"])
+        cursor = body["next_cursor"]
+        if not cursor:
+            break
+        assert pages <= 3
+    assert seen == [("R", 0), ("B", 1), ("C", 2), ("D", 1)]
+    assert pages == 2  # 4 条 / 每页 2 条
+
+    # 最后一页 next_cursor 为 null；重复使用倒数游标得到稳定的同一尾页
+    last = client.get("/threads/R/page", params={"limit": 2}).json()
+    mid_cursor = last["next_cursor"]
+    tail1 = client.get("/threads/R/page", params={"limit": 2, "cursor": mid_cursor}).json()
+    tail2 = client.get("/threads/R/page", params={"limit": 2, "cursor": mid_cursor}).json()
+    assert tail1["next_cursor"] is None
+    assert [i["message_id"] for i in tail1["items"]] == ["C", "D"]
+    assert tail1 == tail2
+
+
+def test_thread_page_large_limit_covers_everything_in_one_page(client):
+    _seed_paged_thread(client)
+    body = client.get("/threads/R/page", params={"limit": 200}).json()
+    assert [i["message_id"] for i in body["items"]] == ["R", "B", "C", "D"]
+    assert body["next_cursor"] is None
+
+
+def test_thread_page_order_matches_nested_thread_preorder(client):
+    _seed_paged_thread(client)
+
+    def preorder(nodes):
+        out = []
+        for n in nodes:
+            out.append(n["message_id"])
+            out.extend(preorder(n["children"]))
+        return out
+
+    nested = client.get("/threads/C").json()["tree"]
+    flat = client.get("/threads/R/page", params={"limit": 200}).json()["items"]
+    assert [i["message_id"] for i in flat] == preorder([nested])
+
+
+def test_thread_page_limit_bounds_validated(client):
+    _seed_paged_thread(client)
+    assert client.get("/threads/R/page", params={"limit": 0}).status_code == 422
+    assert client.get("/threads/R/page", params={"limit": 201}).status_code == 422
+    bad = client.get("/threads/R/page", params={"limit": "two"})
+    assert bad.status_code == 422
+
+
+def test_thread_page_unknown_message_returns_404(client):
+    assert client.get("/threads/nope/page").status_code == 404
+
+
+def test_thread_page_cycle_message_returns_409(client):
+    client.post("/batches", json={"messages": [
+        _m("x", irt="y", refs=["y"], sent="2026-09-18T12:00:00+00:00"),
+        _m("y", irt="x", refs=["x"], sent="2026-09-18T13:00:00+00:00"),
+    ]})
+    r = client.get("/threads/x/page")
+    assert r.status_code == 409
+
+
+def test_thread_page_malformed_cursor_returns_422(client):
+    _seed_paged_thread(client)
+    import base64
+    import json as _json
+
+    def tok(obj) -> str:
+        return base64.urlsafe_b64encode(
+            _json.dumps(obj).encode()
+        ).rstrip(b"=").decode()
+
+    for bad in [
+        "not a cursor!!!",          # 非法字符
+        tok({"v": 1}),               # 缺字段
+        tok({"v": 2, "root_id": "R", "offset": 0, "revision": "x"}),  # 版本不符
+        tok({"v": 1, "root_id": "R", "offset": -1, "revision": "x"}),  # 偏移为负
+        tok({"v": 1, "root_id": 9, "offset": 0, "revision": "x"}),    # 类型错误
+        tok(["not", "an", "object"]),
+        "eyJhIjoxfQ",                # 任意 base64url 但非本游标结构
+    ]:
+        r = client.get("/threads/R/page", params={"limit": 2, "cursor": bad})
+        assert r.status_code == 422, bad
+
+
+def test_thread_page_cursor_for_other_thread_returns_422(client):
+    _seed_paged_thread(client)
+    # 另一棵互不相干的树 P
+    client.post("/batches", json={"messages": [
+        _m("P", sent="2026-09-19T08:00:00+00:00"),
+        _m("Q", irt="P", refs=["P"], sent="2026-09-19T09:00:00+00:00"),
+    ]})
+    foreign = client.get("/threads/P/page", params={"limit": 1}).json()["next_cursor"]
+    r = client.get("/threads/R/page", params={"limit": 2, "cursor": foreign})
+    assert r.status_code == 422
+    # 反向同样不允许
+    home = client.get("/threads/R/page", params={"limit": 1}).json()["next_cursor"]
+    assert client.get("/threads/P/page", params={"cursor": home}).status_code == 422
+
+
+def test_thread_page_stale_cursor_after_relink_returns_409(client):
+    # D 先归档、其父 late 尚未到达 -> D 断链为根；E 正常挂在 D 下
+    client.post("/batches", json={"messages": [
+        _m("D", irt="late", refs=["late"], sent="2026-09-18T09:00:00+00:00"),
+        _m("E", irt="D", refs=["D"], sent="2026-09-18T10:00:00+00:00"),
+    ]})
+    # 迟到邮件随后归档，自成独立根，L2 挂在 late 下
+    client.post("/batches", json={"messages": [
+        _m("late", sent="2026-09-18T07:00:00+00:00"),
+        _m("L2", irt="late", refs=["late"], sent="2026-09-18T07:30:00+00:00"),
+    ]})
+
+    # 游标 1：late 树（根不变，但补链后会并入 D）-> revision 不符
+    cur_same_root = client.get(
+        "/threads/late/page", params={"limit": 1}
+    ).json()["next_cursor"]
+    # 游标 2：D 当时自成根的树（补链后 D 下沉为 late 的子节点）
+    cur_old_root = client.get(
+        "/threads/D/page", params={"limit": 1}
+    ).json()["next_cursor"]
+    assert cur_same_root and cur_old_root
+
+    # 补链：D 挂到 late 下，两棵树合并、结构改变
+    r = client.post("/relinks", json={"message_ids": ["D"]})
+    assert r.status_code == 200
+    assert r.json()["results"][0]["new_parent_id"] == "late"
+
+    stale1 = client.get(
+        "/threads/late/page", params={"limit": 1, "cursor": cur_same_root}
+    )
+    assert stale1.status_code == 409
+    assert stale1.json()["detail"]["error"] == "cursor_stale"
+
+    stale2 = client.get(
+        "/threads/D/page", params={"limit": 1, "cursor": cur_old_root}
+    )
+    assert stale2.status_code == 409
+    assert stale2.json()["detail"]["error"] == "cursor_stale"
+
+    # 不带游标从头开始即正常：late 树下按先序 late L2 D E
+    fresh = client.get("/threads/D/page", params={"limit": 200}).json()
+    assert [(i["message_id"], i["depth"]) for i in fresh["items"]] == [
+        ("late", 0),
+        ("L2", 1),
+        ("D", 1),
+        ("E", 2),
+    ]
+    assert fresh["next_cursor"] is None
+
+
+def test_thread_page_stale_cursor_when_thread_grows_via_new_batch(client):
+    _seed_paged_thread(client)
+    cur = client.get("/threads/R/page", params={"limit": 2}).json()["next_cursor"]
+
+    # 新批次又往同一棵树挂一封邮件，revision 必须改变
+    client.post("/batches", json={"messages": [
+        _m("E", irt="D", refs=["R", "D"], sent="2026-09-18T12:00:00+00:00"),
+    ]})
+    r = client.get("/threads/R/page", params={"limit": 2, "cursor": cur})
+    assert r.status_code == 409
+    assert r.json()["detail"]["error"] == "cursor_stale"
+
+
+def test_thread_page_endpoint_does_not_change_existing_thread_endpoint(client):
+    _seed_paged_thread(client)
+    tree = client.get("/threads/R").json()
+    assert tree["root_id"] == "R"
+    assert tree["tree"]["message_id"] == "R"
+    assert [c["message_id"] for c in tree["tree"]["children"]] == ["B", "D"]
+    assert tree["tree"]["children"][0]["children"][0]["message_id"] == "C"

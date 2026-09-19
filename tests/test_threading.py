@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from app.threading import ThreadMessage, build_forest, resolve_batch
+from app.threading import ThreadMessage, build_flat_tree, build_forest, resolve_batch
 
 
 def msg(mid, irt=None, refs=(), sent="2026-09-18T00:00:00+00:00", subj="s"):
@@ -189,3 +189,33 @@ def test_cycle_does_not_poison_unrelated_tree():
     assert r.parent_of["goodroot"] is None
     forest = build_forest(r.first_seen, r.parent_of)
     assert ids(forest) == ["goodroot", "ok"]
+
+
+def test_build_flat_tree_matches_forest_preorder_and_depth():
+    r = resolve_batch([
+        msg("root1", sent="2026-09-18T00:00:00+00:00"),
+        msg("root2", sent="2026-09-18T01:00:00+00:00"),
+        msg("c1", irt="root1", sent="2026-09-18T03:00:00+00:00"),
+        msg("c2", irt="root1", sent="2026-09-18T02:00:00+00:00"),
+        msg("gc", irt="c1", sent="2026-09-18T04:00:00+00:00"),
+    ])
+    flat = build_flat_tree(r.first_seen, r.parent_of)
+
+    # 与嵌套树先序完全一致
+    assert [f["message_id"] for f in flat] == ids(build_forest(r.first_seen, r.parent_of))
+    # depth：根为 0，逐层递增
+    assert [(f["message_id"], f["depth"], f["parent_id"]) for f in flat] == [
+        ("root1", 0, None),
+        ("c2", 1, "root1"),
+        ("c1", 1, "root1"),
+        ("gc", 2, "c1"),
+        ("root2", 0, None),
+    ]
+    # 扁平节点不含 children，其余树节点字段保留
+    assert "children" not in flat[0]
+    assert flat[0]["subject"] == "s"
+    assert flat[0]["references"] == []
+
+
+def test_build_flat_tree_empty_when_no_messages():
+    assert build_flat_tree({}, {}) == []
