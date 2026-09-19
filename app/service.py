@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import sqlite3
 import uuid
@@ -27,6 +29,14 @@ class RelinkCycleConflict(Exception):
     def __init__(self, cycles: list[list[str]]) -> None:
         self.cycles = cycles
         super().__init__(f"relink would create cycles: {cycles}")
+
+
+class ThreadPageCursorInvalid(Exception):
+    """GET /threads/{id}/page：游标无法解码、字段不合法，或不属于路径所在会话。"""
+
+
+class ThreadPageCursorStale(Exception):
+    """GET /threads/{id}/page：游标 revision 与当前树不一致（分页期间树已变化）。"""
 
 
 def _utc_now_iso() -> str:
@@ -517,5 +527,124 @@ def get_thread(message_id: str) -> Optional[dict]:
         msgs, parents = _load_subtree(conn, root_id)
         forest = threading.build_forest(msgs, parents)
         return {"root_id": root_id, "tree": forest[0] if forest else None}
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# GET /threads/{message_id}/page：稳定游标分页
+# ---------------------------------------------------------------------------
+
+
+def _encode_cursor(root_id: str, offset: int, revision: str) -> str:
+    """把分页状态封装为不透明游标（base64url JSON）。"""
+
+    payload = {"root": root_id, "off": offset, "rev": revision}
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def _decode_cursor(raw: str) -> dict:
+    """解码并校验游标；任何格式问题都抛 ThreadPageCursorInvalid。"""
+
+    try:
+        data = json.loads(base64.urlsafe_b64decode(raw.encode("ascii")))
+    except Exception:
+        raise ThreadPageCursorInvalid("cursor is not valid base64url JSON")
+    if not isinstance(data, dict):
+        raise ThreadPageCursorInvalid("cursor payload must be a JSON object")
+    root, off, rev = data.get("root"), data.get("off"), data.get("rev")
+    if not isinstance(root, str) or not root:
+        raise ThreadPageCursorInvalid("cursor root must be a non-empty string")
+    if not isinstance(off, int) or isinstance(off, bool) or off < 0:
+        raise ThreadPageCursorInvalid("cursor offset must be a non-negative integer")
+    if not isinstance(rev, str) or not rev:
+        raise ThreadPageCursorInvalid("cursor revision must be a non-empty string")
+    return {"root": root, "off": off, "rev": rev}
+
+
+def _tree_revision(
+    messages: dict[str, ThreadMessage],
+    parent_of: dict[str, Optional[str]],
+) -> str:
+    """整棵树的修订号：由全部节点的 (message_id, parent_id, sent_at) 生成。
+
+    补链或新批次归档改变了树的成员 / 父子关系时，revision 必然变化，
+    据此发现跨页期间的树变更，避免漏项或重复。
+    """
+
+    payload = [
+        [mid, parent_of.get(mid), messages[mid].sent_at]
+        for mid in sorted(messages)
+    ]
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _flatten_forest(forest: list[dict]) -> list[dict]:
+    """把 build_forest 的嵌套树按先序展开为扁平列表（含 depth，根为 0）。"""
+
+    items: list[dict] = []
+    stack: list[tuple[dict, int]] = [(node, 0) for node in reversed(forest)]
+    while stack:
+        node, depth = stack.pop()
+        items.append({
+            "message_id": node["message_id"],
+            "parent_id": node["parent_id"],
+            "in_reply_to": node["in_reply_to"],
+            "references": node["references"],
+            "sent_at": node["sent_at"],
+            "subject": node["subject"],
+            "depth": depth,
+        })
+        for child in reversed(node["children"]):
+            stack.append((child, depth + 1))
+    return items
+
+
+def get_thread_page(
+    message_id: str, limit: int, cursor: Optional[str]
+) -> Optional[dict]:
+    """先序扁平分页返回某邮件所属会话树。
+
+    - 首次请求（无 cursor）从偏移 0 开始，沿用 build_forest 的子节点排序展开；
+    - 游标封装 root_id、下一偏移与整树 revision；后续请求重算 revision，
+      不一致说明分页期间树被补链 / 新归档改变，抛 ThreadPageCursorStale；
+    - 游标无法解码、或其 root 与路径邮件所属会话无关，抛 ThreadPageCursorInvalid。
+    """
+
+    conn = database.connect()
+    try:
+        row = conn.execute(
+            "SELECT is_invalid FROM messages WHERE message_id = ?", (message_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        if row["is_invalid"]:
+            return {"invalid": True, "message_id": message_id}
+
+        root_id = _climb_root(conn, message_id)
+        msgs, parents = _load_subtree(conn, root_id)
+        revision = _tree_revision(msgs, parents)
+
+        offset = 0
+        if cursor is not None:
+            cur = _decode_cursor(cursor)
+            if cur["root"] != root_id:
+                # 旧根仍是当前树成员 => 分页期间整树被补链挪走，属于树变更
+                if cur["root"] in msgs:
+                    raise ThreadPageCursorStale()
+                raise ThreadPageCursorInvalid("cursor does not belong to this thread")
+            if cur["rev"] != revision:
+                raise ThreadPageCursorStale()
+            offset = cur["off"]
+
+        items = _flatten_forest(threading.build_forest(msgs, parents))
+        page = items[offset:offset + limit]
+        next_cursor = None
+        if offset + limit < len(items):
+            next_cursor = _encode_cursor(root_id, offset + limit, revision)
+        return {"root_id": root_id, "items": page, "next_cursor": next_cursor}
     finally:
         conn.close()

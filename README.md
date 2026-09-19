@@ -49,9 +49,10 @@ ports:
 | `POST` | `/relinks` | 迟到邮件归档后，批量修复此前断链的有效邮件（HTTP 200） |
 | `GET` | `/messages/{message_id}` | 查询单封邮件及其最终父节点 |
 | `GET` | `/threads/{message_id}` | 查询该邮件所属完整会话树；环邮件返回 **409** |
+| `GET` | `/threads/{message_id}/page?limit=50&cursor=…` | 会话树的稳定游标分页（先序扁平输出，含 `depth`）；分页期间树变化返回 **409** `cursor_stale` |
 | `GET` | `/health` | 健康检查 |
 
-未知 ID：批次 / 邮件查询、`/relinks` 返回 **404**；请求体不合法返回 **422**；
+未知 ID：批次 / 邮件 / 会话查询、`/relinks` 返回 **404**；请求体或查询参数不合法返回 **422**；
 `/relinks` 若合并候选关系后形成环，整次返回 **409** 且不写库。
 
 ### 提交示例
@@ -179,6 +180,43 @@ curl -X POST http://localhost:8000/relinks -H 'Content-Type: application/json' \
   }
 }
 ```
+
+### 会话树分页：`GET /threads/{message_id}/page`
+
+大型会话可分页拉取。首次请求不带 `cursor`，服务沿用与 `GET /threads` 相同的子节点排序
+（`(sent_at, message_id)` 升序）对整棵树做**先序展开**，返回扁平 `items`（每项含 `depth`，
+根为 0）、`root_id` 与 `next_cursor`；`limit` 取值 **1～200**（默认 50），越界返回 **422**。
+
+```bash
+# 第一页
+curl 'http://localhost:8000/threads/A/page?limit=2'
+```
+
+```jsonc
+{
+  "root_id": "A",
+  "items": [
+    {"message_id": "A", "parent_id": null, "depth": 0, "sent_at": "2026-09-18T08:00:00+00:00", "…": "…"},
+    {"message_id": "B", "parent_id": "A",   "depth": 1, "sent_at": "2026-09-18T09:00:00+00:00", "…": "…"}
+  ],
+  "next_cursor": "eyJyb290IjoiQSIsIm9mZiI6MiwicmV2Ijoi…"   // 末页时为 null
+}
+```
+
+```bash
+# 后续页：原样带上上一页返回的 next_cursor
+curl 'http://localhost:8000/threads/A/page?limit=2&cursor=eyJyb290IjoiQSIsIm9mZiI6MiwicmV2Ijoi…'
+```
+
+游标是**不透明**的（base64url JSON），内部封装根 ID、下一偏移量以及由整棵树全部
+`(message_id, parent_id, sent_at)` 生成的 revision。后续请求会重新计算 revision：
+
+- 分页期间树被补链或新归档改变（成员或父子关系变化）→ **409**，响应体
+  `{"detail": "cursor_stale"}`，此时应丢弃旧游标、从第一页重新拉取，避免跨页漏项或重复；
+- 游标格式错误、或不属于路径邮件所在会话 → **422**；
+- 邮件不存在 → **404**；环内邮件 → **409**（与 `GET /threads` 一致）。
+
+只要树未变化，同一游标可重复使用，跨页拼接即为完整、确定、无重复的先序序列。
 
 ## 归并规则
 

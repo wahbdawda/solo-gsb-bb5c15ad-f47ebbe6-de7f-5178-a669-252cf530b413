@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 
@@ -15,6 +16,7 @@ from .schemas import (
     MessageOut,
     RelinkIn,
     RelinkResult,
+    ThreadPage,
 )
 
 
@@ -117,6 +119,33 @@ def get_message(message_id: str) -> dict:
 )
 def get_thread(message_id: str) -> dict:
     result = service.get_thread(message_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="message not found")
+    if result.get("invalid"):
+        raise HTTPException(
+            status_code=409,
+            detail="message belongs to a reference cycle and is not attached to any thread",
+        )
+    return result
+
+
+@app.get(
+    "/threads/{message_id}/page",
+    response_model=ThreadPage,
+    tags=["threads"],
+    summary="稳定游标分页展开会话树（先序扁平输出，含深度）",
+)
+def get_thread_page(
+    message_id: str,
+    limit: int = Query(50, ge=1, le=200),
+    cursor: Optional[str] = Query(None),
+) -> dict:
+    try:
+        result = service.get_thread_page(message_id, limit, cursor)
+    except service.ThreadPageCursorInvalid as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except service.ThreadPageCursorStale:
+        raise HTTPException(status_code=409, detail="cursor_stale")
     if result is None:
         raise HTTPException(status_code=404, detail="message not found")
     if result.get("invalid"):

@@ -370,3 +370,185 @@ def test_relink_self_candidate_is_a_cycle(client):
     r = client.post("/relinks", json={"message_ids": ["zz"]})
     assert r.status_code == 409
     assert r.json()["detail"]["cycles"] == [["zz"]]
+
+
+# ---------------------------------------------------------------------------
+# GET /threads/{message_id}/page：稳定游标分页
+# ---------------------------------------------------------------------------
+
+
+def _page(client, mid, **params):
+    return client.get(f"/threads/{mid}/page", params=params)
+
+
+def _seed_tree(client):
+    """A 为根；B/C 是 A 的子节点；D/E 是 B 的子节点。先序：A B D E C。"""
+
+    client.post("/batches", json={"messages": [
+        _m("A", sent="2026-09-18T08:00:00+00:00"),
+        _m("B", irt="A", refs=["A"], sent="2026-09-18T09:00:00+00:00"),
+        _m("C", irt="A", refs=["A"], sent="2026-09-18T10:00:00+00:00"),
+        _m("D", irt="B", refs=["A", "B"], sent="2026-09-18T11:00:00+00:00"),
+        _m("E", irt="B", refs=["A", "B"], sent="2026-09-18T12:00:00+00:00"),
+    ]})
+
+
+def test_thread_page_paginates_preorder_with_depth(client):
+    _seed_tree(client)
+
+    seen, cursor = [], None
+    while True:
+        params = {"limit": 2}
+        if cursor is not None:
+            params["cursor"] = cursor
+        r = _page(client, "A", **params)
+        assert r.status_code == 200
+        body = r.json()
+        assert body["root_id"] == "A"
+        seen.extend((i["message_id"], i["depth"]) for i in body["items"])
+        cursor = body["next_cursor"]
+        if cursor is None:
+            break
+    # 跨页拼接 = 完整先序展开，无漏项无重复
+    assert seen == [("A", 0), ("B", 1), ("D", 2), ("E", 2), ("C", 1)]
+
+
+def test_thread_page_from_any_member_and_item_fields(client):
+    _seed_tree(client)
+
+    # 从树中任意邮件出发，得到同一棵树的同一分页
+    r = _page(client, "D", limit=200)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["root_id"] == "A"
+    assert [i["message_id"] for i in body["items"]] == ["A", "B", "D", "E", "C"]
+    assert body["next_cursor"] is None
+
+    item = body["items"][1]
+    assert item == {
+        "message_id": "B",
+        "parent_id": "A",
+        "in_reply_to": "A",
+        "references": ["A"],
+        "sent_at": "2026-09-18T09:00:00+00:00",
+        "subject": "hello",
+        "depth": 1,
+    }
+
+
+def test_thread_page_limit_bounds(client):
+    client.post("/batches", json={"messages": [_m("A")]})
+    assert _page(client, "A", limit=0).status_code == 422
+    assert _page(client, "A", limit=201).status_code == 422
+    assert _page(client, "A", limit=1).status_code == 200
+    assert _page(client, "A", limit=200).status_code == 200
+    # 默认 limit 可用；单节点树一页到底
+    body = _page(client, "A").json()
+    assert [i["message_id"] for i in body["items"]] == ["A"]
+    assert body["next_cursor"] is None
+
+
+def test_thread_page_unknown_message_404(client):
+    assert _page(client, "ghost").status_code == 404
+
+
+def test_thread_page_cycle_message_409(client):
+    client.post("/batches", json={"messages": [
+        _m("x", irt="y", refs=["y"]),
+        _m("y", irt="x", refs=["x"]),
+    ]})
+    assert _page(client, "x").status_code == 409
+
+
+def test_thread_page_malformed_cursor_422(client):
+    import base64
+
+    client.post("/batches", json={"messages": [_m("A")]})
+    assert _page(client, "A", cursor="not-a-cursor").status_code == 422
+    # base64 合法但不是 JSON 对象
+    bad = base64.urlsafe_b64encode(b"[1,2]").decode()
+    assert _page(client, "A", cursor=bad).status_code == 422
+    # JSON 对象但缺字段
+    bad2 = base64.urlsafe_b64encode(b'{"root":"A"}').decode()
+    assert _page(client, "A", cursor=bad2).status_code == 422
+
+
+def test_thread_page_cursor_from_other_thread_422(client):
+    client.post("/batches", json={"messages": [
+        _m("A", sent="2026-09-18T08:00:00+00:00"),
+        _m("B", irt="A", refs=["A"], sent="2026-09-18T09:00:00+00:00"),
+        _m("X", sent="2026-09-18T08:00:00+00:00"),
+    ]})
+    cursor = _page(client, "A", limit=1).json()["next_cursor"]
+    assert cursor
+    assert _page(client, "X", cursor=cursor).status_code == 422
+
+
+def test_thread_page_stale_after_new_arrivals_409(client):
+    client.post("/batches", json={"messages": [
+        _m("A", sent="2026-09-18T08:00:00+00:00"),
+        _m("B", irt="A", refs=["A"], sent="2026-09-18T09:00:00+00:00"),
+    ]})
+    cursor = _page(client, "A", limit=1).json()["next_cursor"]
+
+    # 分页期间新邮件挂到同棵树 -> revision 变化
+    client.post("/batches", json={"messages": [
+        _m("C", irt="A", refs=["A"], sent="2026-09-18T10:00:00+00:00"),
+    ]})
+    r = _page(client, "A", cursor=cursor)
+    assert r.status_code == 409
+    assert r.json()["detail"] == "cursor_stale"
+
+
+def test_thread_page_stale_after_relink_moves_tree_409(client):
+    # D 断链为根、E 挂在 D 下；分页中途 D 被补链到迟到邮件之下，整树挪走
+    client.post("/batches", json={"messages": [
+        _m("D", irt="late", refs=["ghost"], sent="2026-09-18T09:00:00+00:00"),
+        _m("E", irt="D", refs=["D"], sent="2026-09-18T10:00:00+00:00"),
+    ]})
+    first = _page(client, "E", limit=1).json()
+    assert first["root_id"] == "D"
+    cursor = first["next_cursor"]
+
+    client.post("/batches", json={"messages": [
+        _m("late", sent="2026-09-18T07:00:00+00:00"),
+    ]})
+    assert client.post("/relinks", json={"message_ids": ["D"]}).json()["relinked"] == 1
+
+    r = _page(client, "E", cursor=cursor)
+    assert r.status_code == 409
+    assert r.json()["detail"] == "cursor_stale"
+
+    # 重新从第一页开始，可拿到新树的完整分页
+    fresh = _page(client, "E", limit=200).json()
+    assert fresh["root_id"] == "late"
+    assert [i["message_id"] for i in fresh["items"]] == ["late", "D", "E"]
+
+
+def test_thread_page_stale_after_relink_into_tree_409(client):
+    # 分页 A 的树期间，断链根 G 被补链接入该树 -> revision 变化
+    client.post("/batches", json={"messages": [
+        _m("A", sent="2026-09-18T08:00:00+00:00"),
+        _m("B", irt="A", refs=["A"], sent="2026-09-18T09:00:00+00:00"),
+        _m("G", irt="late", refs=["ghost"], sent="2026-09-18T10:00:00+00:00"),
+    ]})
+    cursor = _page(client, "A", limit=1).json()["next_cursor"]
+
+    client.post("/batches", json={"messages": [
+        _m("late", irt="A", refs=["A"], sent="2026-09-18T07:00:00+00:00"),
+    ]})
+    assert client.post("/relinks", json={"message_ids": ["G"]}).json()["relinked"] == 1
+
+    r = _page(client, "A", cursor=cursor)
+    assert r.status_code == 409
+    assert r.json()["detail"] == "cursor_stale"
+
+
+def test_thread_page_stable_without_changes(client):
+    _seed_tree(client)
+    first = _page(client, "A", limit=3).json()
+    again = _page(client, "A", limit=3, cursor=first["next_cursor"]).json()
+    # 树未变化时同一游标可重复使用，第二页内容确定
+    assert [i["message_id"] for i in again["items"]] == ["E", "C"]
+    assert again["next_cursor"] is None
+    assert _page(client, "A", limit=3, cursor=first["next_cursor"]).json() == again

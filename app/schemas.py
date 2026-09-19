@@ -150,4 +150,23 @@ class RelinkResult(BaseModel):
     results: list[RelinkItem] = Field(..., description="按请求顺序逐封给出新旧父/根；未变更者新旧值相同")
 
 
+class ThreadPageItem(BaseModel):
+    message_id: str
+    parent_id: Optional[str]
+    in_reply_to: Optional[str]
+    references: list[str]
+    # 透传库中存储的 UTC ISO 8601 字符串，与 GET /threads 输出完全一致
+    sent_at: str = Field(..., description="UTC ISO 8601")
+    subject: str
+    depth: int = Field(..., description="先序展开深度，根为 0")
+
+
+class ThreadPage(BaseModel):
+    root_id: str = Field(..., description="该邮件所属会话树的根")
+    items: list[ThreadPageItem] = Field(..., description="本页邮件，先序扁平展开")
+    next_cursor: Optional[str] = Field(
+        None, description="下一页游标；为 null 表示已到末页"
+    )
+
+
 TreeNode.model_rebuild()
